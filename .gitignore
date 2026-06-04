@@ -1,0 +1,28 @@
+# --- 절대 커밋 금지: 실제 대화 데이터가 들어있음 ---
+# Tier 1 recency 캐시(JSONL) — 사용자 지시/어시스턴트 요약 평문
+cache/
+# Tier 2 mem0 벡터 스토어(chroma sqlite + 임베딩) — 대화 본문 청크
+store/
+
+# 격리된 가상환경 (install 스크립트로 재생성)
+.venv/
+
+# 파이썬 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+
+# detached ingest 워커가 쓰고 지우는 임시 인자 파일(경합 중 남을 수 있음)
+_ingest_*.txt
+
+# 컴팩션 시 라이브 에이전트 감지 플래그
+*.flag
+post-compact-pending.flag
+
+# OMC 런타임 상태
+.omc/
+
+# 혹시 모를 토큰/시크릿
+*.token
+viewer-url.txt
+.env

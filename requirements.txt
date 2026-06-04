@@ -1,0 +1,14 @@
+# Compaction-resilient memory — 고정 의존성 (CPU 전용 torch)
+#
+# torch CPU 휠은 PyTorch 전용 인덱스에 있다. 아래 extra-index 가 Linux/Windows 의
+# `+cpu` 휠을 받아온다. macOS 는 `+cpu` 접미사가 없으니 install.sh 가 자동으로
+# `torch==2.12.0` 로 치환한다(README 참고).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+mem0ai==2.0.4
+chromadb==1.5.9
+sentence-transformers==5.5.1
+transformers==5.10.1
+numpy==2.4.6
+onnxruntime==1.26.0
+torch==2.12.0+cpu
