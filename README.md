@@ -1,22 +1,37 @@
 # claude-compaction-memory
 
-Claude Code가 컨텍스트를 압축(compaction)하거나 세션을 닫으면 그동안 쌓인 맥락이 날아간다. 이걸 hook 두 개로 붙잡아 두는 도구다. 100% 로컬, API 키 필요 없음.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
-- **PreCompact** — 압축 직전에 최근 대화를 디스크에 적어둔다.
-- **SessionStart** — 세션을 새로 켜거나 재개·압축할 때마다 적어둔 맥락을 자동으로 다시 넣어준다.
+Persistent memory for Claude Code that survives context compaction and session restarts. 100% local, no API key.
 
-mem0만 쓰면 모델이 "메모리 조회를 깜빡하는" 문제가 있고, hook만 쓰면 세션 끝나면 사라진다. 둘을 합쳐서 양쪽 약점을 없앴다.
+## Highlights
 
-## 2계층 구조
+- **Survives compaction and session end** — two hooks (`PreCompact` + `SessionStart`) snapshot the recent conversation and re-inject it automatically on the next start.
+- **No hot-path latency** — session start reads a plain-text cache only; the embedding model (torch) is never loaded inline. **~0.08s instead of ~13s.**
+- **Two-tier recall** — a fast JSONL recency cache, backed by an async mem0 + Chroma semantic store for deeper lookups.
+- **Local and keyless** — HuggingFace `all-MiniLM-L6-v2` embeddings + Chroma on disk. No OpenAI key, no daemon.
+- **Path-scoped silos** — recall is isolated per working directory, so unrelated projects never bleed into one another.
+- **Cross-platform** — Windows, Linux, and macOS.
 
-세션 시작 같은 핫패스에서 임베딩 모델(torch)을 건드리면 매번 13초씩 멈춘다. 그래서 회상을 두 단으로 나눴다.
+## How it works
 
-- **Tier 1 — 평문 JSONL 캐시.** 핫패스는 이것만 읽는다. torch를 안 건드려서 **0.08초**에 끝난다.
-- **Tier 2 — mem0 + chroma 의미 검색.** torch 로드는 분리된 백그라운드 프로세스로 던져서 hook은 기다리지 않는다. 깊은 회상이 필요할 때만 쓴다.
+Claude Code compacts the conversation when context fills up, and drops it entirely when a session closes. Two hooks close that gap:
 
-세션 시작이 13.4초에서 0.08초로 줄었다(약 160배). 13.4초는 전부 임베딩 모델 로딩이었다.
+- **`PreCompact`** writes the recent conversation delta to disk right before compaction.
+- **`SessionStart`** reads it back and injects it as `additionalContext` on every start, resume, or compact.
 
-## 설치
+Recall is split into two tiers so the hot path stays instant:
+
+| Tier | Store | Used by | Latency |
+| --- | --- | --- | --- |
+| 1 | plain-text JSONL recency cache | every session start | ~0.08s |
+| 2 | mem0 + Chroma vector store | on-demand semantic recall | async, off the hot path |
+
+The expensive embedding model loads only inside a detached background worker, so the hooks never block on it. mem0 alone tends to be forgotten by the model; hooks alone vanish when the session ends — combining them removes both failure modes.
+
+## Installation
 
 ```bash
 git clone https://github.com/twmoon/claude-compaction-memory.git
@@ -26,34 +41,54 @@ cd claude-compaction-memory
 ```powershell
 .\install.ps1      # Windows
 ```
+
 ```bash
 ./install.sh       # Linux / macOS
 ```
 
-격리된 `.venv`를 만들고 의존성을 깔고, 마지막에 `~/.claude/settings.json`에 붙여넣을 hook 스니펫(절대경로 포함)을 출력한다. 그걸 `"hooks"` 아래에 넣으면 끝.
+The installer creates an isolated virtualenv, installs pinned dependencies (CPU-only torch), pre-downloads the embedding model, and prints a ready-to-paste hook snippet.
 
-> hook은 **Claude Code 세션을 재시작해야** 적용된다.
+## Configuration
 
-## 파일
+Add the printed snippet to the `"hooks"` block of `~/.claude/settings.json` (the installer fills in the absolute paths):
 
-| 파일 | 역할 |
-|------|------|
-| `mem_lib.py` | mem0 래퍼(무키) + 캐시 헬퍼 + 사일로 키 계산 |
-| `save.py` | PreCompact hook — 캐시 저장 + 백그라운드 적재 |
-| `restore.py` | SessionStart hook — 캐시 최근 6건 주입 |
-| `ingest.py` | 분리 프로세스 Tier 2 워커 |
-| `braindump.py` | 수동 저장 ("지금 이거 기억해") |
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "matcher": "manual|auto",
+        "hooks": [{ "type": "command", "timeout": 45, "command": "<venv-python> save.py" }] }
+    ],
+    "SessionStart": [
+      { "matcher": "startup|resume|compact",
+        "hooks": [{ "type": "command", "timeout": 45, "command": "<venv-python> restore.py" }] }
+    ]
+  }
+}
+```
 
-## 사일로
+> Hooks take effect after you **restart Claude Code**.
 
-회상은 **작업 폴더 경로**로 나뉜다. basename이 아니라 전체 경로라서 `ctf-a/web1`과 `ctf-b/web1`이 섞이지 않는다. 상위 폴더에 빈 `.memroot`를 두면 그 아래는 한 사일로로 묶인다.
+## Project layout
 
-## 알아둘 것
+| File | Role |
+| --- | --- |
+| `mem_lib.py` | mem0 wrapper (keyless) + cache helpers + silo-key logic |
+| `save.py` | `PreCompact` hook — write cache, spawn async ingest |
+| `restore.py` | `SessionStart` hook — inject the 6 most recent entries |
+| `ingest.py` | detached Tier-2 worker |
+| `braindump.py` | manual "remember this now" capture |
 
-- **핫패스에서 mem0를 직접 부르지 말 것.** `get_memory()`가 torch를 끌어와서 13초가 걸린다. 새 hook을 붙일 땐 캐시만 읽고, mem0 적재는 `spawn_ingest`로 백그라운드에 던져라.
-- **mem0 2.0.4 주의:** `search()`/`get_all()`에 `user_id`를 직접 넘기면 안 되고 `filters={"user_id": ...}`로 줘야 한다. 안 그러면 조용히 0건이 나온다.
-- **venv는 `--system-site-packages` 금지.** 시스템/anaconda의 옛 numpy ABI가 새어 들어오면 `dtype size 96 vs 88`로 터진다. install 스크립트가 완전 격리 + CPU torch로 깔아준다.
+## Silos
 
-## 라이선스
+Recall is keyed by the **full working-directory path**, not its basename — so `ctf-a/web1` and `ctf-b/web1` never merge. Drop an empty `.memroot` file in a parent directory to group everything beneath it into a single silo.
 
-MIT
+## Notes
+
+- **Never call mem0 directly on the hot path.** `get_memory()` pulls in torch (~13s). New hooks should read the cache and push ingestion to `spawn_ingest` in the background.
+- **mem0 2.0.4:** pass `filters={"user_id": ...}` to `search()` / `get_all()`. A top-level `user_id` is silently ignored and returns nothing.
+- **Don't build the venv with `--system-site-packages`.** A leaked system/anaconda NumPy ABI causes `dtype size 96 vs 88` crashes. The installer builds a fully isolated env with CPU-only torch.
+
+## License
+
+[MIT](./LICENSE)
